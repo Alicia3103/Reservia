@@ -1,0 +1,216 @@
+    if (typeof item.char === 'string') {
+      const {
+        char,
+        offset
+      } = item;
+
+      if (char === '?' && key === undefined && !explicitKey) {
+        explicitKey = true;
+        next = ':';
+        continue;
+      }
+
+      if (char === ':') {
+        if (key === undefined) key = null;
+
+        if (next === ':') {
+          next = ',';
+          continue;
+        }
+      } else {
+        if (explicitKey) {
+          if (key === undefined && char !== ',') key = null;
+          explicitKey = false;
+        }
+
+        if (key !== undefined) {
+          items.push(new Pair(key));
+          key = undefined;
+
+          if (char === ',') {
+            next = ':';
+            continue;
+          }
+        }
+      }
+
+      if (char === '}') {
+        if (i === cst.items.length - 1) continue;
+      } else if (char === next) {
+        next = ':';
+        continue;
+      }
+
+      const msg = `Flow map contains an unexpected ${char}`;
+      const err = new PlainValue.YAMLSyntaxError(cst, msg);
+      err.offset = offset;
+      doc.errors.push(err);
+    } else if (item.type === PlainValue.Type.BLANK_LINE) {
+      comments.push({
+        afterKey: !!key,
+        before: items.length
+      });
+    } else if (item.type === PlainValue.Type.COMMENT) {
+      checkFlowCommentSpace(doc.errors, item);
+      comments.push({
+        afterKey: !!key,
+        before: items.length,
+        comment: item.comment
+      });
+    } else if (key === undefined) {
+      if (next === ',') doc.errors.push(new PlainValue.YAMLSemanticError(item, 'Separator , missing in flow map'));
+      key = resolveNode(doc, item);
+    } else {
+      if (next !== ',') doc.errors.push(new PlainValue.YAMLSemanticError(item, 'Indicator : missing in flow map entry'));
+      items.push(new Pair(key, resolveNode(doc, item)));
+      key = undefined;
+      explicitKey = false;
+    }
+  }
+
+  checkFlowCollectionEnd(doc.errors, cst);
+  if (key !== undefined) items.push(new Pair(key));
+  return {
+    comments,
+    items
+  };
+}
+
+function resolveSeq(doc, cst) {
+  if (cst.type !== PlainValue.Type.SEQ && cst.type !== PlainValue.Type.FLOW_SEQ) {
+    const msg = `A ${cst.type} node cannot be resolved as a sequence`;
+    doc.errors.push(new PlainValue.YAMLSyntaxError(cst, msg));
+    return null;
+  }
+
+  const {
+    comments,
+    items
+  } = cst.type === PlainValue.Type.FLOW_SEQ ? resolveFlowSeqItems(doc, cst) : resolveBlockSeqItems(doc, cst);
+  const seq = new YAMLSeq();
+  seq.items = items;
+  resolveComments(seq, comments);
+
+  if (!doc.options.mapAsMap && items.some(it => it instanceof Pair && it.key instanceof Collection)) {
+    const warn = 'Keys with collection values will be stringified as YAML due to JS Object restrictions. Use mapAsMap: true to avoid this.';
+    doc.warnings.push(new PlainValue.YAMLWarning(cst, warn));
+  }
+
+  cst.resolved = seq;
+  return seq;
+}
+
+function resolveBlockSeqItems(doc, cst) {
+  const comments = [];
+  const items = [];
+
+  for (let i = 0; i < cst.items.length; ++i) {
+    const item = cst.items[i];
+
+    switch (item.type) {
+      case PlainValue.Type.BLANK_LINE:
+        comments.push({
+          before: items.length
+        });
+        break;
+
+      case PlainValue.Type.COMMENT:
+        comments.push({
+          comment: item.comment,
+          before: items.length
+        });
+        break;
+
+      case PlainValue.Type.SEQ_ITEM:
+        if (item.error) doc.errors.push(item.error);
+        items.push(resolveNode(doc, item.node));
+
+        if (item.hasProps) {
+          const msg = 'Sequence items cannot have tags or anchors before the - indicator';
+          doc.errors.push(new PlainValue.YAMLSemanticError(item, msg));
+        }
+
+        break;
+
+      default:
+        if (item.error) doc.errors.push(item.error);
+        doc.errors.push(new PlainValue.YAMLSyntaxError(item, `Unexpected ${item.type} node in sequence`));
+    }
+  }
+
+  return {
+    comments,
+    items
+  };
+}
+
+function resolveFlowSeqItems(doc, cst) {
+  const comments = [];
+  const items = [];
+  let explicitKey = false;
+  let key = undefined;
+  let keyStart = null;
+  let next = '[';
+  let prevItem = null;
+
+  for (let i = 0; i < cst.items.length; ++i) {
+    const item = cst.items[i];
+
+    if (typeof item.char === 'string') {
+      const {
+        char,
+        offset
+      } = item;
+
+      if (char !== ':' && (explicitKey || key !== undefined)) {
+        if (explicitKey && key === undefined) key = next ? items.pop() : null;
+        items.push(new Pair(key));
+        explicitKey = false;
+        key = undefined;
+        keyStart = null;
+      }
+
+      if (char === next) {
+        next = null;
+      } else if (!next && char === '?') {
+        explicitKey = true;
+      } else if (next !== '[' && char === ':' && key === undefined) {
+        if (next === ',') {
+          key = items.pop();
+
+          if (key instanceof Pair) {
+            const msg = 'Chaining flow sequence pairs is invalid';
+            const err = new PlainValue.YAMLSemanticError(cst, msg);
+            err.offset = offset;
+            doc.errors.push(err);
+          }
+
+          if (!explicitKey && typeof keyStart === 'number') {
+            const keyEnd = item.range ? item.range.start : item.offset;
+            if (keyEnd > keyStart + 1024) doc.errors.push(getLongKeyError(cst, key));
+            const {
+              src
+            } = prevItem.context;
+
+            for (let i = keyStart; i < keyEnd; ++i) if (src[i] === '\n') {
+              const msg = 'Implicit keys of flow sequence pairs need to be on a single line';
+              doc.errors.push(new PlainValue.YAMLSemanticError(prevItem, msg));
+              break;
+            }
+          }
+        } else {
+          key = null;
+        }
+
+        keyStart = null;
+        explicitKey = false;
+        next = null;
+      } else if (next === '[' || char !== ']' || i < cst.items.length - 1) {
+        const msg = `Flow sequence contains an unexpected ${char}`;
+        const err = new PlainValue.YAMLSyntaxError(cst, msg);
+        err.offset = offset;
+        doc.errors.push(err);
+      }
+    } else if (item.type === PlainValue.Type.BLANK_LINE) {
+      comments.push({
+        before: it
